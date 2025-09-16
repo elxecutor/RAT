@@ -1,0 +1,55 @@
+# Compiled binaries
+server
+client
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+*.lo
+*.slo
+
+# Shared libraries
+*.so
+*.dylib
+*.dll
+
+# Static libraries
+*.a
+*.lib
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Core dumps
+core
+core.*
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build directories
+build/
+dist/
+bin/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Backup files
+*.bak
+*.backup
