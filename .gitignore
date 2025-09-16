@@ -53,3 +53,5 @@ bin/
 # Backup files
 *.bak
 *.backup
+
+TODO.md
