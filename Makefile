@@ -17,7 +17,7 @@ LDFLAGS =
 ifeq ($(DETECTED_OS),Windows)
     # Windows-specific settings
     CFLAGS = $(BASE_CFLAGS) -D_WIN32_WINNT=0x0600
-    LDFLAGS = -lws2_32 -ladvapi32 -lshell32
+    LDFLAGS = -lws2_32 -ladvapi32 -lshell32 -lssl -lcrypto
     EXE_EXT = .exe
     RM = del /Q
     MKDIR = mkdir
@@ -25,7 +25,7 @@ ifeq ($(DETECTED_OS),Windows)
 else
     # Linux/Unix settings
     CFLAGS = $(BASE_CFLAGS) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-    LDFLAGS = 
+    LDFLAGS = -lssl -lcrypto
     EXE_EXT = 
     RM = rm -f
     MKDIR = mkdir -p
@@ -43,8 +43,8 @@ CLIENT_TARGET = $(BIN_DIR)/client$(EXE_EXT)
 SERVER_TARGET = $(BIN_DIR)/server$(EXE_EXT)
 
 # Source files
-CLIENT_SRC = $(SRC_DIR)/client.c $(SRC_DIR)/persistence.c
-SERVER_SRC = $(SRC_DIR)/server.c
+CLIENT_SRC = $(SRC_DIR)/client.c $(SRC_DIR)/persistence.c $(SRC_DIR)/crypto.c
+SERVER_SRC = $(SRC_DIR)/server.c $(SRC_DIR)/crypto.c
 
 # Object files (in src directory to keep things clean)
 CLIENT_OBJ = $(CLIENT_SRC:.c=.o)
@@ -107,13 +107,13 @@ release: all
 # Cross-compilation targets
 windows: CC=x86_64-w64-mingw32-gcc
 windows: CFLAGS=$(BASE_CFLAGS) -D_WIN32_WINNT=0x0600
-windows: LDFLAGS=-lws2_32 -ladvapi32 -lshell32
+windows: LDFLAGS=-lws2_32 -ladvapi32 -lshell32 -lssl -lcrypto
 windows: EXE_EXT=.exe
 windows: $(BIN_DIR) $(CLIENT_TARGET) $(SERVER_TARGET)
 
 linux: CC=gcc
 linux: CFLAGS=$(BASE_CFLAGS) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-linux: LDFLAGS=
+linux: LDFLAGS=-lssl -lcrypto
 linux: EXE_EXT=
 linux: $(BIN_DIR) $(CLIENT_TARGET) $(SERVER_TARGET)
 

