@@ -20,7 +20,7 @@ When reporting a bug, please include:
 - **Screenshots or logs** if available.
 - **Information about your environment** (e.g., OS, software versions).
 
-Submit your bug report via the [issue tracker]({{REPO_URL}}/issues).
+Submit your bug report via the [issue tracker](https://github.com/elxecutor/RAT/issues).
 
 ## How to Request a Feature
 For feature requests, please:

